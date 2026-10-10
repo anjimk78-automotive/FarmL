@@ -25,7 +25,6 @@ st.set_page_config(
 OSRM_BASE_URL = "https://router.project-osrm.org"
 REQUEST_TIMEOUT = 45
 MAX_SELECTED_FARMS = 25
-GAP_WARN_METERS = 25  # stops farther than this from a mapped road get a dashed link + warning
 FARMS_HEADERS = ["Farm Name", "Latitude", "Longitude"]
 USERS_HEADERS = ["Username", "Password Hash", "Role", "Active", "Created At"]
 
@@ -47,12 +46,6 @@ def secret_value(*keys, default=None):
         return value
     except Exception:
         return default
-
-
-def osrm_base_url():
-    """Routing server URL. Override with app.osrm_url in Streamlit Secrets (e.g. your own OSRM)."""
-    url = secret_value("app", "osrm_url", default=OSRM_BASE_URL)
-    return str(url).rstrip("/")
 
 
 def get_gspread_client():
@@ -234,7 +227,7 @@ def get_osrm_table(locations):
     Uses the public OSRM demo service; do not send frequent/high-volume production traffic.
     """
     coordinate_string = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in locations)
-    url = f"{osrm_base_url()}/table/v1/driving/{coordinate_string}"
+    url = f"{OSRM_BASE_URL}/table/v1/driving/{coordinate_string}"
     response = requests.get(
         url,
         params={"annotations": "distance,duration"},
@@ -312,7 +305,7 @@ def get_osrm_route(locations):
     overview=full returns every vertex (all small streets and turns), not a simplified line.
     """
     coordinate_string = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in locations)
-    url = f"{osrm_base_url()}/route/v1/driving/{coordinate_string}"
+    url = f"{OSRM_BASE_URL}/route/v1/driving/{coordinate_string}"
     response = requests.get(
         url,
         params={
@@ -332,19 +325,7 @@ def get_osrm_route(locations):
     route = payload["routes"][0]
     # GeoJSON coordinates are [longitude, latitude]; Folium needs [latitude, longitude].
     geometry = [[lat, lon] for lon, lat in route["geometry"]["coordinates"]]
-
-    # Where the router actually snapped each stop onto its road network.
-    # "distance" is how far (metres) the stop was from the nearest usable road.
-    snaps = []
-    for wp in payload.get("waypoints", []):
-        loc = wp.get("location") or [None, None]
-        snaps.append(
-            {
-                "snapped": (loc[1], loc[0]),
-                "gap_m": float(wp.get("distance") or 0.0),
-            }
-        )
-    return geometry, float(route["distance"]) / 1000, float(route["duration"]) / 60, snaps
+    return geometry, float(route["distance"]) / 1000, float(route["duration"]) / 60
 
 
 def point_near_route_km(lat, lon, route_points):
@@ -410,7 +391,7 @@ def add_base_layers(fmap):
     ).add_to(fmap)
 
 
-def make_route_map(farms, start_name, start_coord, selected_order, recommended_names, route_geometry, snap_gaps=None):
+def make_route_map(farms, start_name, start_coord, selected_order, recommended_names, route_geometry):
     center = start_coord
     fmap = folium.Map(
         location=center,
@@ -439,18 +420,6 @@ def make_route_map(farms, start_name, start_coord, selected_order, recommended_n
             smooth_factor=0,
             tooltip="Optimized driving route",
         ).add_to(fmap)
-
-    # Dashed connectors where a stop is off the mapped road network (unmapped lane/driveway).
-    for gap in snap_gaps or []:
-        if gap["gap_m"] >= GAP_WARN_METERS:
-            folium.PolyLine(
-                [gap["snapped"], gap["original"]],
-                color="#ffd400",
-                weight=4,
-                opacity=1.0,
-                dash_array="6 8",
-                tooltip=f"{gap['name']}: not on a mapped road, about {gap['gap_m']:.0f} m off-road link",
-            ).add_to(fmap)
 
     # Starting marker
     folium.Marker(
@@ -682,24 +651,7 @@ def main():
                 route_locations = [start_coord] + [
                     (farm["Latitude"], farm["Longitude"]) for farm in ordered_rows
                 ]
-                route_geometry, total_km, total_minutes, snaps = get_osrm_route(route_locations)
-
-                # Build "off-road gap" records: stop position vs. where the router put it.
-                stop_labels = [start_name.strip() or "Starting location"] + [
-                    farm["Farm Name"] for farm in ordered_rows
-                ]
-                snap_gaps = []
-                for label, original, snap in zip(stop_labels, route_locations, snaps):
-                    if snap["snapped"][0] is None:
-                        continue
-                    snap_gaps.append(
-                        {
-                            "name": label,
-                            "original": (float(original[0]), float(original[1])),
-                            "snapped": (float(snap["snapped"][0]), float(snap["snapped"][1])),
-                            "gap_m": snap["gap_m"],
-                        }
-                    )
+                route_geometry, total_km, total_minutes = get_osrm_route(route_locations)
 
                 # Recommend farms near the road route, but do NOT add them to the route order.
                 ordered_names = {farm["Farm Name"] for farm in ordered_rows}
@@ -730,7 +682,6 @@ def main():
                     "selected_order": ordered_rows,
                     "recommended": recommended,
                     "route_geometry": route_geometry,
-                    "snap_gaps": snap_gaps,
                     "total_km": total_km,
                     "total_minutes": total_minutes,
                     "objective": objective_label,
@@ -781,16 +732,6 @@ def main():
     metric2.metric("Driving distance", f"{result['total_km']:.1f} km")
     metric3.metric("Estimated driving time", f"{result['total_minutes']:.0f} min")
 
-    off_road = [g for g in result.get("snap_gaps", []) if g["gap_m"] >= GAP_WARN_METERS]
-    if off_road:
-        details = "; ".join(f"{g['name']} (~{g['gap_m']:.0f} m)" for g in off_road)
-        st.warning(
-            "Some stops are not on a road known to the routing data, so the blue route stops at the "
-            "nearest mapped road (shown with a yellow dashed link): "
-            f"{details}. The final stretch is not included in the distance or time. "
-            "Add the missing road in OpenStreetMap or use your own routing server (app.osrm_url)."
-        )
-
     map_col, side_col = st.columns([2.2, 1], gap="large")
     with map_col:
         st.subheader("Optimized route map")
@@ -801,7 +742,6 @@ def main():
             result["selected_order"],
             recommended_names,
             result["route_geometry"],
-            result.get("snap_gaps"),
         )
         st_folium(fmap, use_container_width=True, height=650, returned_objects=[])
 
