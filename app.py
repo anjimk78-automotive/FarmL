@@ -25,9 +25,11 @@ st.set_page_config(
 OSRM_BASE_URL = "https://router.project-osrm.org"
 REQUEST_TIMEOUT = 45
 MAX_SELECTED_FARMS = 25
-GAP_WARN_METERS = 25  # stops farther than this from a mapped road get a dashed link + warning
+GAP_WARN_METERS = 25      # stop farther than this from a mapped road -> warning
+ACCESS_SPEED_KMH = 15.0   # assumed speed on hand-drawn access roads (dirt tracks)
 FARMS_HEADERS = ["Farm Name", "Latitude", "Longitude"]
 USERS_HEADERS = ["Username", "Password Hash", "Role", "Active", "Created At"]
+ACCESS_HEADERS = ["Farm Name", "Order", "Latitude", "Longitude"]
 
 # Esri tile layers (free for light use; keep attribution visible).
 ESRI_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -142,6 +144,66 @@ def get_users_worksheet():
     )
 
 
+# ---------------------------- Access roads (hand-drawn roads missing from map data) ----------------------------
+
+def get_access_worksheet():
+    return get_or_create_worksheet(
+        get_spreadsheet(), "AccessPaths", ACCESS_HEADERS, rows=3000, cols=6
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_access_paths():
+    """
+    Returns {farm name: [(lat, lon), ...]}.
+    First point = on a road the routing service knows (entry point),
+    last point = the farm itself.
+    """
+    try:
+        records = get_access_worksheet().get_all_records()
+    except Exception:
+        return {}
+    grouped = {}
+    for rec in records:
+        name = str(rec.get("Farm Name", "")).strip()
+        try:
+            order = int(float(rec.get("Order")))
+            lat = float(rec.get("Latitude"))
+            lon = float(rec.get("Longitude"))
+        except (TypeError, ValueError):
+            continue
+        if name:
+            grouped.setdefault(name, []).append((order, lat, lon))
+    return {
+        name: [(lat, lon) for _, lat, lon in sorted(points)]
+        for name, points in grouped.items()
+    }
+
+
+def save_access_path(farm_name, points):
+    """Replace the stored access road for one farm. points=[] deletes it."""
+    ws = get_access_worksheet()
+    values = ws.get_all_values()
+    header = values[0] if values else ACCESS_HEADERS
+    keep = [
+        row for row in values[1:]
+        if row and str(row[0]).strip().lower() != farm_name.strip().lower()
+    ]
+    new_rows = [
+        [farm_name, i, round(lat, 7), round(lon, 7)]
+        for i, (lat, lon) in enumerate(points, start=1)
+    ]
+    ws.clear()
+    ws.append_rows([header] + keep + new_rows, value_input_option="USER_ENTERED")
+    load_access_paths.clear()
+
+
+def path_length_km(points):
+    return sum(
+        haversine_km(a[0], a[1], b[0], b[1]) for a, b in zip(points[:-1], points[1:])
+    )
+
+
 # ---------------------------- Authentication ----------------------------
 
 def hash_password(password, salt=None):
@@ -252,7 +314,7 @@ def get_osrm_table(locations):
     if any(value is None for row in distances for value in row):
         raise RuntimeError(
             "At least one selected farm could not be connected by the road-routing service. "
-            "Check the coordinates and try again."
+            "Check the coordinates (or draw an access road for it) and try again."
         )
     if any(value is None for row in durations for value in row):
         raise RuntimeError("Travel time is unavailable for one or more selected locations.")
@@ -308,8 +370,9 @@ def optimize_open_route(cost_matrix):
 
 def get_osrm_route(locations):
     """
-    Get the full-resolution, road-following geometry for the optimized sequence.
-    overview=full returns every vertex (all small streets and turns), not a simplified line.
+    Full-resolution road-following geometry, returned per leg (stop to stop)
+    so hand-drawn access roads can be spliced in at the right place.
+    Returns: leg_geometries, total_km, total_minutes, snaps
     """
     coordinate_string = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in locations)
     url = f"{osrm_base_url()}/route/v1/driving/{coordinate_string}"
@@ -318,7 +381,7 @@ def get_osrm_route(locations):
         params={
             "overview": "full",
             "geometries": "geojson",
-            "steps": "false",
+            "steps": "true",
             "alternatives": "false",
             "continue_straight": "false",
         },
@@ -330,21 +393,23 @@ def get_osrm_route(locations):
     if payload.get("code") != "Ok" or not payload.get("routes"):
         raise RuntimeError(f"Could not retrieve route geometry: {payload.get('message', payload.get('code'))}")
     route = payload["routes"][0]
-    # GeoJSON coordinates are [longitude, latitude]; Folium needs [latitude, longitude].
-    geometry = [[lat, lon] for lon, lat in route["geometry"]["coordinates"]]
+
+    # GeoJSON is [longitude, latitude]; Folium needs [latitude, longitude].
+    leg_geometries = []
+    for leg in route.get("legs", []):
+        points = []
+        for step in leg.get("steps", []):
+            for lon, lat in step["geometry"]["coordinates"]:
+                if not points or points[-1] != [lat, lon]:
+                    points.append([lat, lon])
+        leg_geometries.append(points)
 
     # Where the router actually snapped each stop onto its road network.
-    # "distance" is how far (metres) the stop was from the nearest usable road.
     snaps = []
     for wp in payload.get("waypoints", []):
         loc = wp.get("location") or [None, None]
-        snaps.append(
-            {
-                "snapped": (loc[1], loc[0]),
-                "gap_m": float(wp.get("distance") or 0.0),
-            }
-        )
-    return geometry, float(route["distance"]) / 1000, float(route["duration"]) / 60, snaps
+        snaps.append({"snapped": (loc[1], loc[0]), "gap_m": float(wp.get("distance") or 0.0)})
+    return leg_geometries, float(route["distance"]) / 1000, float(route["duration"]) / 60, snaps
 
 
 def point_near_route_km(lat, lon, route_points):
@@ -410,10 +475,12 @@ def add_base_layers(fmap):
     ).add_to(fmap)
 
 
-def make_route_map(farms, start_name, start_coord, selected_order, recommended_names, route_geometry, snap_gaps=None):
-    center = start_coord
+def make_route_map(
+    farms, start_name, start_coord, selected_order, recommended_names,
+    route_geometry, snap_gaps=None, show_gap_links=False,
+):
     fmap = folium.Map(
-        location=center,
+        location=start_coord,
         zoom_start=12,
         max_zoom=21,
         control_scale=True,
@@ -440,17 +507,18 @@ def make_route_map(farms, start_name, start_coord, selected_order, recommended_n
             tooltip="Optimized driving route",
         ).add_to(fmap)
 
-    # Dashed connectors where a stop is off the mapped road network (unmapped lane/driveway).
-    for gap in snap_gaps or []:
-        if gap["gap_m"] >= GAP_WARN_METERS:
-            folium.PolyLine(
-                [gap["snapped"], gap["original"]],
-                color="#ffd400",
-                weight=4,
-                opacity=1.0,
-                dash_array="6 8",
-                tooltip=f"{gap['name']}: not on a mapped road, about {gap['gap_m']:.0f} m off-road link",
-            ).add_to(fmap)
+    # Optional straight link for stops that are still off the mapped network.
+    if show_gap_links:
+        for gap in snap_gaps or []:
+            if gap["gap_m"] >= GAP_WARN_METERS:
+                folium.PolyLine(
+                    [gap["snapped"], gap["original"]],
+                    color="#ffd400",
+                    weight=3,
+                    opacity=0.9,
+                    dash_array="6 8",
+                    tooltip=f"{gap['name']}: straight-line link (~{gap['gap_m']:.0f} m), not a real road",
+                ).add_to(fmap)
 
     # Starting marker
     folium.Marker(
@@ -548,6 +616,121 @@ def show_login():
         st.caption("The first admin account is configured through Streamlit Secrets. See README.md.")
 
 
+# ---------------------------- Access road editor (admin) ----------------------------
+
+def show_access_editor(farms, access):
+    st.title("🛣️ Access road editor")
+    st.write(
+        "Some farm roads are visible on the satellite image but missing from the routing data. "
+        "Draw them here once and every route will drive along them."
+    )
+    st.info(
+        "**How to draw:** click the **first point on a main road that the routing service knows** "
+        "(a labelled road such as the Negombo–Puttalam road), then click along the track toward the farm, "
+        "following every bend. The farm itself is added automatically as the last point."
+    )
+
+    farm_names = farms["Farm Name"].tolist()
+    name = st.selectbox("Farm", farm_names, key="editor_farm")
+    farm_row = farms.loc[farms["Farm Name"] == name].iloc[0]
+    farm_coord = (float(farm_row["Latitude"]), float(farm_row["Longitude"]))
+
+    # Reset the draft whenever a different farm is selected.
+    if st.session_state.get("editor_loaded_farm") != name:
+        existing = access.get(name, [])
+        st.session_state["draft_path"] = [list(p) for p in existing[:-1]] if existing else []
+        st.session_state["editor_loaded_farm"] = name
+        st.session_state["editor_view"] = {"center": [farm_coord[0], farm_coord[1]], "zoom": 17}
+        st.session_state["editor_last_click"] = None
+
+    draft = st.session_state["draft_path"]
+    view = st.session_state["editor_view"]
+
+    editor_map = folium.Map(
+        location=view["center"],
+        zoom_start=view["zoom"],
+        max_zoom=21,
+        control_scale=True,
+        tiles=None,
+    )
+    add_base_layers(editor_map)
+    folium.Marker(
+        farm_coord,
+        tooltip=f"Farm: {name}",
+        icon=folium.Icon(color="red", icon="info-sign"),
+    ).add_to(editor_map)
+
+    if draft:
+        full = [tuple(p) for p in draft] + [farm_coord]
+        folium.PolyLine(full, color="#ffffff", weight=8, opacity=0.9).add_to(editor_map)
+        folium.PolyLine(full, color="#ffd400", weight=4, opacity=1.0).add_to(editor_map)
+        for i, p in enumerate(draft, start=1):
+            folium.CircleMarker(
+                p,
+                radius=5,
+                color="#000000",
+                weight=1,
+                fill=True,
+                fill_color="#00e5ff" if i == 1 else "#ffd400",
+                fill_opacity=1,
+                tooltip="Entry point (must be on a mapped road)" if i == 1 else f"Point {i}",
+            ).add_to(editor_map)
+    folium.LayerControl(collapsed=True, position="topright").add_to(editor_map)
+
+    map_data = st_folium(
+        editor_map,
+        use_container_width=True,
+        height=620,
+        returned_objects=["last_clicked", "center", "zoom"],
+        key="access_editor_map",
+    )
+
+    if map_data:
+        if map_data.get("center") and map_data.get("zoom") is not None:
+            st.session_state["editor_view"] = {
+                "center": [map_data["center"]["lat"], map_data["center"]["lng"]],
+                "zoom": map_data["zoom"],
+            }
+        click = map_data.get("last_clicked")
+        if click:
+            click_key = (round(click["lat"], 7), round(click["lng"], 7))
+            if click_key != st.session_state.get("editor_last_click"):
+                st.session_state["editor_last_click"] = click_key
+                st.session_state["draft_path"].append([click["lat"], click["lng"]])
+                st.rerun()
+
+    full_path = [tuple(p) for p in draft] + [farm_coord]
+    length_km = path_length_km(full_path) if draft else 0.0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Points drawn", len(draft))
+    c2.metric("Road length", f"{length_km * 1000:.0f} m")
+    if c3.button("↩️ Undo last point", use_container_width=True, disabled=not draft):
+        st.session_state["draft_path"].pop()
+        st.rerun()
+    if c4.button("🧹 Clear drawing", use_container_width=True, disabled=not draft):
+        st.session_state["draft_path"] = []
+        st.rerun()
+
+    s1, s2 = st.columns(2)
+    if s1.button("💾 Save access road", type="primary", use_container_width=True, disabled=not draft):
+        try:
+            save_access_path(name, full_path)
+            st.success(f"Saved access road for {name}.")
+        except Exception as exc:
+            st.error(f"Could not save: {exc}")
+    if s2.button("🗑️ Delete saved road", use_container_width=True, disabled=name not in access):
+        try:
+            save_access_path(name, [])
+            st.session_state["draft_path"] = []
+            st.success(f"Deleted the access road for {name}.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not delete: {exc}")
+
+    if access:
+        st.caption("Farms with a saved access road: " + ", ".join(sorted(access.keys())))
+
+
 # ---------------------------- Main app ----------------------------
 
 def main():
@@ -558,7 +741,9 @@ def main():
         st.session_state.pop("user", None)
         st.rerun()
 
+    page = "Route planner"
     if user["role"] == "admin":
+        page = st.sidebar.radio("Page", ["Route planner", "Access road editor"])
         with st.sidebar.expander("⚙️ User management", expanded=False):
             st.caption("Create a login for another team member.")
             with st.form("create_user_form", clear_on_submit=True):
@@ -573,9 +758,6 @@ def main():
                 except Exception as exc:
                     st.error(str(exc))
 
-    st.title("Farm Route Planner")
-    st.write("Select farms to visit. Nearby unselected farms will be suggested separately and will not be added to your route.")
-
     try:
         farms = load_farms()
     except Exception as exc:
@@ -589,6 +771,15 @@ def main():
             "'Farm Name', 'Latitude', and 'Longitude'."
         )
         st.stop()
+
+    access = load_access_paths()
+
+    if page == "Access road editor":
+        show_access_editor(farms, access)
+        return
+
+    st.title("Farm Route Planner")
+    st.write("Select farms to visit. Nearby unselected farms will be suggested separately and will not be added to your route.")
 
     # Use a sidebar control panel; map and results are displayed in the main area.
     st.sidebar.subheader("Route settings")
@@ -630,6 +821,12 @@ def main():
         step=0.5,
         help="Nearby unselected farms appear in a separate section. They are not added to the route.",
     )
+    show_gap_links = st.sidebar.checkbox(
+        "Show straight links for unmapped stops",
+        value=False,
+        help="Draws a yellow dashed straight line from the end of the mapped road to a stop. "
+             "It is only a hint, not a real road.",
+    )
     search_clicked = st.sidebar.button(
         "🔎 Search & Optimize Route",
         type="primary",
@@ -659,8 +856,16 @@ def main():
         selected_df["__selection_order"] = selected_df["Farm Name"].apply(selected_names.index)
         selected_df = selected_df.sort_values("__selection_order").drop(columns="__selection_order")
 
-        locations = [start_coord] + [
-            (float(row["Latitude"]), float(row["Longitude"]))
+        # Stops with a saved access road are routed to the road's entry point;
+        # the access road itself is added to the route afterwards.
+        def routing_point(farm_name, coord):
+            path = access.get(farm_name)
+            return tuple(path[0]) if path else coord
+
+        start_farm_for_path = start_name if start_mode == "Registered farm" else None
+        start_routing = routing_point(start_farm_for_path, start_coord) if start_farm_for_path else start_coord
+        locations = [start_routing] + [
+            routing_point(row["Farm Name"], (float(row["Latitude"]), float(row["Longitude"])))
             for _, row in selected_df.iterrows()
         ]
 
@@ -670,6 +875,7 @@ def main():
                 cost_matrix = distance_matrix if objective_label == "Shortest driving distance" else duration_matrix
                 order_indices = optimize_open_route(cost_matrix)
                 ordered_rows = []
+                ordered_points = []
                 for idx in order_indices:
                     row = selected_df.iloc[idx - 1]
                     ordered_rows.append(
@@ -679,12 +885,39 @@ def main():
                             "Longitude": float(row["Longitude"]),
                         }
                     )
-                route_locations = [start_coord] + [
-                    (farm["Latitude"], farm["Longitude"]) for farm in ordered_rows
-                ]
-                route_geometry, total_km, total_minutes, snaps = get_osrm_route(route_locations)
+                    ordered_points.append(locations[idx])
+                route_locations = [start_routing] + ordered_points
+                leg_geometries, osrm_km, osrm_minutes, snaps = get_osrm_route(route_locations)
 
-                # Build "off-road gap" records: stop position vs. where the router put it.
+                # Splice hand-drawn access roads into the road geometry.
+                route_geometry = []
+                access_km = 0.0
+
+                def extend(points):
+                    for p in points:
+                        p = [float(p[0]), float(p[1])]
+                        if not route_geometry or route_geometry[-1] != p:
+                            route_geometry.append(p)
+
+                start_path = access.get(start_farm_for_path) if start_farm_for_path else None
+                if start_path:
+                    extend(list(reversed(start_path)))          # farm -> road
+                    access_km += path_length_km(start_path)
+                last_index = len(ordered_rows) - 1
+                for i, leg in enumerate(leg_geometries):
+                    extend(leg)
+                    stop_path = access.get(ordered_rows[i]["Farm Name"]) if i < len(ordered_rows) else None
+                    if stop_path:
+                        extend(stop_path)                        # road -> farm
+                        access_km += path_length_km(stop_path)
+                        if i < last_index:
+                            extend(list(reversed(stop_path)))    # farm -> back to road
+                            access_km += path_length_km(stop_path)
+
+                total_km = osrm_km + access_km
+                total_minutes = osrm_minutes + (access_km / ACCESS_SPEED_KMH) * 60
+
+                # Stops that are still far from any mapped road.
                 stop_labels = [start_name.strip() or "Starting location"] + [
                     farm["Farm Name"] for farm in ordered_rows
                 ]
@@ -731,13 +964,14 @@ def main():
                     "recommended": recommended,
                     "route_geometry": route_geometry,
                     "snap_gaps": snap_gaps,
+                    "access_km": access_km,
                     "total_km": total_km,
                     "total_minutes": total_minutes,
                     "objective": objective_label,
                     "recommendation_radius": recommendation_radius,
                 }
         except requests.RequestException as exc:
-            st.error(f"Could not reach the public routing service. Try again later. Details: {exc}")
+            st.error(f"Could not reach the routing service. Try again later. Details: {exc}")
             st.stop()
         except Exception as exc:
             st.error(f"Could not calculate the route: {exc}")
@@ -781,14 +1015,19 @@ def main():
     metric2.metric("Driving distance", f"{result['total_km']:.1f} km")
     metric3.metric("Estimated driving time", f"{result['total_minutes']:.0f} min")
 
+    if result.get("access_km", 0) > 0:
+        st.caption(
+            f"Includes {result['access_km'] * 1000:.0f} m on hand-drawn access roads "
+            f"(estimated at {ACCESS_SPEED_KMH:.0f} km/h)."
+        )
+
     off_road = [g for g in result.get("snap_gaps", []) if g["gap_m"] >= GAP_WARN_METERS]
     if off_road:
         details = "; ".join(f"{g['name']} (~{g['gap_m']:.0f} m)" for g in off_road)
         st.warning(
-            "Some stops are not on a road known to the routing data, so the blue route stops at the "
-            "nearest mapped road (shown with a yellow dashed link): "
-            f"{details}. The final stretch is not included in the distance or time. "
-            "Add the missing road in OpenStreetMap or use your own routing server (app.osrm_url)."
+            "These stops are not on a road known to the routing data, so the blue route ends at the "
+            f"nearest mapped road: {details}. An admin can draw the missing road on the "
+            "**Access road editor** page so the route follows it."
         )
 
     map_col, side_col = st.columns([2.2, 1], gap="large")
@@ -802,6 +1041,7 @@ def main():
             recommended_names,
             result["route_geometry"],
             result.get("snap_gaps"),
+            show_gap_links,
         )
         st_folium(fmap, use_container_width=True, height=650, returned_objects=[])
 
