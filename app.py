@@ -1,12 +1,12 @@
 import hashlib
 import hmac
 import math
-import os
 import secrets
 from datetime import datetime, timezone
 
 import folium
 import gspread
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -27,6 +27,12 @@ REQUEST_TIMEOUT = 45
 MAX_SELECTED_FARMS = 25
 FARMS_HEADERS = ["Farm Name", "Latitude", "Longitude"]
 USERS_HEADERS = ["Username", "Password Hash", "Role", "Active", "Created At"]
+
+# Esri tile layers (free for light use; keep attribution visible).
+ESRI_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+ESRI_ROADS = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"
+ESRI_PLACES = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+ESRI_ATTR = "Imagery &copy; Esri, Maxar, Earthstar Geographics"
 
 
 # ---------------------------- Secrets / Google Sheets ----------------------------
@@ -294,12 +300,21 @@ def optimize_open_route(cost_matrix):
 
 
 def get_osrm_route(locations):
-    """Get road-following GeoJSON geometry and route totals for the optimized sequence."""
+    """
+    Get the full-resolution, road-following geometry for the optimized sequence.
+    overview=full returns every vertex (all small streets and turns), not a simplified line.
+    """
     coordinate_string = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in locations)
     url = f"{OSRM_BASE_URL}/route/v1/driving/{coordinate_string}"
     response = requests.get(
         url,
-        params={"overview": "full", "geometries": "geojson", "steps": "false"},
+        params={
+            "overview": "full",
+            "geometries": "geojson",
+            "steps": "false",
+            "alternatives": "false",
+            "continue_straight": "false",
+        },
         timeout=REQUEST_TIMEOUT,
         headers={"User-Agent": "FarmRouteOptimizer/1.0 (Streamlit prototype)"},
     )
@@ -314,24 +329,95 @@ def get_osrm_route(locations):
 
 
 def point_near_route_km(lat, lon, route_points):
-    # Route geometry is detailed; minimum distance to a route vertex is a practical
-    # lightweight recommendation filter for this prototype.
+    """Shortest distance (km) from a point to the route polyline (segment-accurate)."""
     if not route_points:
         return float("inf")
-    return min(haversine_km(lat, lon, rlat, rlon) for rlat, rlon in route_points)
+    arr = np.asarray(route_points, dtype=float)
+    if len(arr) == 1:
+        return haversine_km(lat, lon, arr[0][0], arr[0][1])
+
+    # Local flat projection centred on the point (accurate for short distances).
+    x = (arr[:, 1] - lon) * 111.320 * math.cos(math.radians(lat))
+    y = (arr[:, 0] - lat) * 110.574
+    ax, ay = x[:-1], y[:-1]
+    bx, by = x[1:], y[1:]
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    safe_len2 = np.where(len2 == 0, 1.0, len2)
+    t = np.clip(-(ax * dx + ay * dy) / safe_len2, 0.0, 1.0)
+    px = ax + t * dx
+    py = ay + t * dy
+    return float(np.min(np.hypot(px, py)))
+
+
+def add_base_layers(fmap):
+    """Satellite imagery with road/street-name and place-name overlays (shows small streets)."""
+    folium.TileLayer(
+        tiles=ESRI_IMAGERY,
+        attr=ESRI_ATTR,
+        name="Satellite",
+        overlay=False,
+        control=True,
+        max_zoom=21,
+        max_native_zoom=19,
+    ).add_to(fmap)
+    folium.TileLayer(
+        tiles=ESRI_ROADS,
+        attr="Roads &copy; Esri",
+        name="Roads & street names",
+        overlay=True,
+        control=True,
+        show=True,
+        max_zoom=21,
+        max_native_zoom=19,
+    ).add_to(fmap)
+    folium.TileLayer(
+        tiles=ESRI_PLACES,
+        attr="Places &copy; Esri",
+        name="Place names",
+        overlay=True,
+        control=True,
+        show=True,
+        max_zoom=21,
+        max_native_zoom=19,
+    ).add_to(fmap)
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="Street map (OSM)",
+        overlay=False,
+        control=True,
+        max_zoom=21,
+        max_native_zoom=19,
+    ).add_to(fmap)
 
 
 def make_route_map(farms, start_name, start_coord, selected_order, recommended_names, route_geometry):
     center = start_coord
-    fmap = folium.Map(location=center, zoom_start=10, control_scale=True, tiles="OpenStreetMap")
+    fmap = folium.Map(
+        location=center,
+        zoom_start=12,
+        max_zoom=21,
+        control_scale=True,
+        tiles=None,
+    )
+    add_base_layers(fmap)
 
     # Road route first so markers remain visible above it.
+    # A white casing under a bright line keeps it readable on satellite imagery.
     if route_geometry and len(route_geometry) >= 2:
+        folium.PolyLine(
+            route_geometry,
+            color="#ffffff",
+            weight=9,
+            opacity=0.9,
+            smooth_factor=0,
+        ).add_to(fmap)
         folium.PolyLine(
             route_geometry,
             color="#1769ff",
             weight=5,
-            opacity=0.85,
+            opacity=1.0,
+            smooth_factor=0,
             tooltip="Optimized driving route",
         ).add_to(fmap)
 
@@ -387,11 +473,16 @@ def make_route_map(farms, start_name, start_coord, selected_order, recommended_n
             ),
         ).add_to(fmap)
 
-    # Ensure all markers and route fit in the visible map area.
-    bounds = [start_coord]
+    folium.LayerControl(collapsed=False, position="topright").add_to(fmap)
+
+    # Fit the map to the full route (every vertex is used, nothing skipped).
+    bounds = [list(start_coord)]
     bounds.extend([[f["Latitude"], f["Longitude"]] for f in selected_order])
     if route_geometry:
-        bounds.extend(route_geometry[:: max(1, len(route_geometry) // 50)])
+        lats = [p[0] for p in route_geometry]
+        lons = [p[1] for p in route_geometry]
+        bounds.append([min(lats), min(lons)])
+        bounds.append([max(lats), max(lons)])
     if len(bounds) > 1:
         fmap.fit_bounds(bounds, padding=(25, 25))
     return fmap
@@ -613,8 +704,11 @@ def main():
         preview_map = folium.Map(
             location=[float(farms["Latitude"].mean()), float(farms["Longitude"].mean())],
             zoom_start=9,
+            max_zoom=21,
             control_scale=True,
+            tiles=None,
         )
+        add_base_layers(preview_map)
         for _, farm in farms.iterrows():
             folium.Marker(
                 [farm["Latitude"], farm["Longitude"]],
@@ -622,6 +716,7 @@ def main():
                 popup=farm["Farm Name"],
                 icon=folium.Icon(color="red", icon="info-sign"),
             ).add_to(preview_map)
+        folium.LayerControl(collapsed=False, position="topright").add_to(preview_map)
         st_folium(preview_map, use_container_width=True, height=560, returned_objects=[])
         st.caption(f"Loaded {len(farms)} farm locations from Google Sheets.")
         return
