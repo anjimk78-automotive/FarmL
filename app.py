@@ -28,6 +28,10 @@ MAX_SELECTED_FARMS = 25
 FARMS_HEADERS = ["Farm Name", "Latitude", "Longitude"]
 USERS_HEADERS = ["Username", "Password Hash", "Role", "Active", "Created At"]
 
+# Cache lifetimes (seconds). Raise these if you still hit Google's read quota.
+FARMS_CACHE_TTL = 300
+USERS_CACHE_TTL = 120
+
 # Esri tile layers (free for light use; keep attribution visible).
 ESRI_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 ESRI_ROADS = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"
@@ -75,24 +79,40 @@ def get_spreadsheet():
     return client.open_by_key(str(sheet_id))
 
 
-def get_or_create_worksheet(spreadsheet, title, headers, rows=1000, cols=10):
+@st.cache_resource
+def ensure_worksheet(title, headers, rows=1000, cols=10):
+    """
+    Open (or create) a worksheet and make sure row 1 has headers.
+    Cached, so this runs once per server process instead of on every rerun.
+    """
+    spreadsheet = get_spreadsheet()
     try:
         worksheet = spreadsheet.worksheet(title)
+        if not worksheet.row_values(1):
+            worksheet.append_row(headers, value_input_option="USER_ENTERED")
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
-        worksheet.append_row(headers, value_input_option="USER_ENTERED")
-    values = worksheet.get_all_values()
-    if not values:
         worksheet.append_row(headers, value_input_option="USER_ENTERED")
     return worksheet
 
 
+def get_users_worksheet():
+    return ensure_worksheet("Users", USERS_HEADERS, rows=500, cols=8)
+
+
+@st.cache_data(ttl=FARMS_CACHE_TTL, show_spinner=False)
+def fetch_farm_records():
+    ws = ensure_worksheet("Farms", FARMS_HEADERS, rows=2000, cols=6)
+    return ws.get_all_records()
+
+
+@st.cache_data(ttl=USERS_CACHE_TTL, show_spinner=False)
+def fetch_user_records():
+    return get_users_worksheet().get_all_records()
+
+
 def load_farms():
-    spreadsheet = get_spreadsheet()
-    worksheet = get_or_create_worksheet(
-        spreadsheet, "Farms", FARMS_HEADERS, rows=2000, cols=6
-    )
-    records = worksheet.get_all_records()
+    records = fetch_farm_records()
     if not records:
         return pd.DataFrame(columns=FARMS_HEADERS)
 
@@ -128,13 +148,6 @@ def load_farms():
     return df
 
 
-def get_users_worksheet():
-    spreadsheet = get_spreadsheet()
-    return get_or_create_worksheet(
-        spreadsheet, "Users", USERS_HEADERS, rows=500, cols=8
-    )
-
-
 # ---------------------------- Authentication ----------------------------
 
 def hash_password(password, salt=None):
@@ -155,11 +168,13 @@ def verify_password(password, stored_hash):
         return False
 
 
-def bootstrap_admin_if_needed():
+@st.cache_resource
+def bootstrap_once():
+    """Create the first admin if none exists. Runs once per server process."""
     ws = get_users_worksheet()
     rows = ws.get_all_records()
     if any(str(r.get("Role", "")).strip().lower() == "admin" for r in rows):
-        return
+        return True
 
     username = str(secret_value("app", "bootstrap_admin_username", default="") or "").strip()
     password = str(secret_value("app", "bootstrap_admin_password", default="") or "")
@@ -174,11 +189,12 @@ def bootstrap_admin_if_needed():
             ],
             value_input_option="USER_ENTERED",
         )
+        fetch_user_records.clear()
+    return True
 
 
 def authenticate(username, password):
-    ws = get_users_worksheet()
-    for row in ws.get_all_records():
+    for row in fetch_user_records():
         saved_username = str(row.get("Username", "")).strip()
         active = str(row.get("Active", "TRUE")).strip().lower() in ("true", "yes", "1")
         if saved_username.lower() == username.strip().lower() and active:
@@ -194,6 +210,7 @@ def add_user(username, password, role="user"):
     if len(password) < 10:
         raise ValueError("Use a password with at least 10 characters.")
     ws = get_users_worksheet()
+    # Fresh read (not cached) so duplicates are caught reliably; this is a rare action.
     existing = [str(r.get("Username", "")).strip().lower() for r in ws.get_all_records()]
     if username.lower() in existing:
         raise ValueError("That username already exists.")
@@ -207,6 +224,17 @@ def add_user(username, password, role="user"):
         ],
         value_input_option="USER_ENTERED",
     )
+    fetch_user_records.clear()
+
+
+def friendly_sheets_error(exc):
+    text = str(exc)
+    if "429" in text or "Quota exceeded" in text:
+        return (
+            "Google Sheets read limit reached. Wait about a minute and reload the page. "
+            "Data is cached to avoid this."
+        )
+    return text
 
 
 # ---------------------------- Routing and geometry ----------------------------
@@ -513,7 +541,7 @@ def show_login():
                         else:
                             st.error("Invalid username/password, or the account is inactive.")
                     except Exception as exc:
-                        st.error(f"Login could not be completed: {exc}")
+                        st.error(f"Login could not be completed: {friendly_sheets_error(exc)}")
         st.caption("The first admin account is configured through Streamlit Secrets. See README.md.")
 
 
@@ -540,7 +568,11 @@ def main():
                     add_user(new_username, new_password, new_role)
                     st.success(f"User '{new_username.strip()}' created.")
                 except Exception as exc:
-                    st.error(str(exc))
+                    st.error(friendly_sheets_error(exc))
+
+    if st.sidebar.button("↻ Reload farms from sheet", use_container_width=True):
+        fetch_farm_records.clear()
+        st.rerun()
 
     st.title("Farm Route Planner")
     st.write("Select farms to visit. Nearby unselected farms will be suggested separately and will not be added to your route.")
@@ -548,7 +580,7 @@ def main():
     try:
         farms = load_farms()
     except Exception as exc:
-        st.error(str(exc))
+        st.error(friendly_sheets_error(exc))
         st.info("Check your Google Sheets setup and the README.md deployment instructions.")
         st.stop()
 
@@ -799,11 +831,11 @@ def main():
 
 def run_app():
     try:
-        # Create the Users tab if needed and add the initial admin only if configured and none exists.
-        bootstrap_admin_if_needed()
+        # Creates the Users tab if needed and adds the initial admin once per server process.
+        bootstrap_once()
     except Exception as exc:
         st.title("🗺️ Farm Route Optimizer")
-        st.error(f"Google Sheets connection setup failed: {exc}")
+        st.error(f"Google Sheets connection setup failed: {friendly_sheets_error(exc)}")
         st.info("Follow the Google Sheets and Streamlit Secrets setup in README.md.")
         st.stop()
 
